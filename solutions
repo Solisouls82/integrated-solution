@@ -1,0 +1,157 @@
+locals {
+
+  user_map = {
+    for user in var.granted_user_accounts : user.username => user
+  }
+
+  shared_prefixes = [
+    for p in local.shared_workspace_prefixes : "${p}/*"
+  ]
+
+  shared_resources = [
+    for p in local.shared_workspace_prefixes :
+    "arn:aws:s3:::${var.shared_workspace_bucket}/${p}/*"
+  ]
+
+  # Grab any conf_* values from user's assignments
+  confidential = length([for i in var.assignments : i if length(regexall("conf_*", i)) > 0]) > 0 ? true : false
+
+  sagemaker_studio_execution_role = {
+    dev  = "arn:aws:iam::730335313798:role/dev-ides-sagemaker-studio-execution-role"
+    qa   = "" # no QA IDE environment
+    prod = "arn:aws:iam::202533541645:role/prod-ides-sagemaker-studio-dpah-execution-role"
+  }
+
+  # Create user Sagemaker Studio profile components from user email
+  user_email           = try(lookup(local.user_map["${var.username}"], "email", ""))
+  user_email_user      = try(split("@", local.user_email)[0], "")
+  user_email_domain    = try(replace(split("@", local.user_email)[1], ".", "-"), "")
+  user_email_user_name = try(replace(title(local.user_email_user), ".", "-"), "")
+
+  user_assume_role_policy_doc = templatefile("${path.module}/policies/user_assume_role_policy.json", {
+    environment                     = var.environment
+    account_id                      = var.account_id
+    assume_role_user                = var.username
+    assume_role_admins              = var.admin_users
+    assume_role_pilot_users         = var.pilot_users
+    sagemaker_instance_role_exists  = regexall("\"${var.username}\"\\s+provision_in\\s+=\\s+\\[.*\"${var.environment}\".*]", var.sagemaker_users)
+    sagemaker_instance_role_arn     = "arn:aws:iam::${var.account_id}:role/${upper(var.project_abbr)}-${upper(var.environment)}-SAGEMAKER-INSTANCE-ROLE-${upper(var.username)}"
+    sagemaker_studio_prefix         = "${local.user_email_user_name}-${local.user_email_domain}"
+    sagemaker_studio_execution_role = lookup(local.sagemaker_studio_execution_role, "${var.environment}", "")
+    user_sso_role                   = var.user_sso_role
+    tier1_sso_role                  = var.tier1_sso_role
+    oidc_provider_arn               = var.oidc_provider_arn
+    oidc_provider_url               = var.oidc_provider_url
+    oidc_provider_aud               = var.oidc_provider_aud
+    oidc_user_email                 = local.user_email
+  })
+
+  user_athena_policy_doc = templatefile("${path.module}/policies/user_athena_policy.json", {
+    account_id          = var.account_id
+    athena_query_bucket = "${var.environment}-oigdw-athena-defult-query-result"
+    environment         = var.environment
+    region              = var.region
+    workgroup           = "data_workbench_user"
+  })
+
+  user_workspace_policy_doc = templatefile("${path.module}/policies/user_workspace_policy.json", {
+    personal_workspace_bucket = var.bucket_root_path
+    username                  = var.username
+    shared_workspace_bucket   = var.shared_workspace_bucket
+    shared_prefixes_json      = jsonencode(local.shared_prefixes)
+    shared_resources_json     = jsonencode(local.shared_resources)
+  })
+}
+
+resource "aws_iam_role" "dwb_user" {
+
+  name                  = var.user_role_name_new
+  assume_role_policy    = local.user_assume_role_policy_doc
+  force_detach_policies = true
+  max_session_duration  = 43200
+  permissions_boundary  = var.permissions_boundary
+
+  tags = {
+
+    Compliance              = var.compliance
+    CreatedOn               = timestamp()
+    DataSet                 = var.dataset
+    Name                    = var.user_role_name_new
+    Proper_Name             = var.user_role_name_new
+    Resource_Name           = var.user_role_name_new
+    Security                = var.security
+    Security_Categorization = var.security_categorization
+    Service                 = "iam-role"
+    Version                 = "1.0.0"
+  }
+
+  lifecycle {
+    prevent_destroy = false
+
+    ignore_changes = [
+      tags["CreatedOn"]
+    ]
+  }
+}
+
+# Create User S3 (Personal Workspace) access policy from policy doc
+resource "aws_iam_policy" "user_workspace_access_policy" {
+
+  name        = "${upper(var.project_abbr)}-${upper(var.environment)}-${upper(var.account_type)}-${upper(var.username)}-S3-POLICY"
+  description = "Policy for User (${upper(var.username)}) to access its S3 bucket or subdir"
+
+  policy = local.user_workspace_policy_doc
+
+  tags = {
+
+    Compliance              = var.compliance
+    CreatedOn               = timestamp()
+    DataSet                 = var.dataset
+    Name                    = "${upper(var.project_abbr)}-${upper(var.environment)}-${upper(var.account_type)}-${upper(var.username)}-S3-POLICY"
+    Resource_Name           = "${lower(var.project_abbr)}_${lower(var.environment)}_${lower(var.account_type)}_${lower(var.username)}_s3_policy"
+    Security                = var.security
+    Security_Categorization = var.security_categorization
+    Service                 = "iam-policy"
+  }
+
+  lifecycle {
+    prevent_destroy = false
+
+    ignore_changes = [
+      tags["CreatedOn"]
+    ]
+  }
+}
+
+
+# Attach User S3 access policy to new User role
+resource "aws_iam_role_policy_attachment" "dwb_user_workspace_attachment" {
+
+  role       = aws_iam_role.dwb_user.name
+  policy_arn = aws_iam_policy.user_workspace_access_policy.arn
+}
+
+
+# Attach User Athena access policy to new User role
+resource "aws_iam_role_policy_attachment" "dwb_user_default_athena_attachment" {
+  count      = local.confidential == false ? 1 : 0
+  role       = aws_iam_role.dwb_user.name
+  policy_arn = var.default_athena_policy_arn
+}
+
+
+# Attach User Data Delivery access policy to new User role
+resource "aws_iam_role_policy_attachment" "dwb_user_data_delivery_enforcement" {
+
+  role       = aws_iam_role.dwb_user.name
+  policy_arn = var.data_delivery_access_policy_arn
+}
+
+# Attach Glue Data Catalog KMS policy to new User role
+resource "aws_iam_role_policy_attachment" "dwb_user_glue_data_catalog_kms_attachment" {
+
+  count = strcontains(lower(var.username), "test") ? 0 : 1
+
+  role       = aws_iam_role.dwb_user.name
+  policy_arn = var.glue_data_catalog_kms_policy_arn
+}
